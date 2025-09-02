@@ -22,10 +22,24 @@ open http://localhost:5173
 
 ## Snapshot
 
+You can now snapshot different parts of the repo:
+
 ```bash
-make rv-snapshot
-# Outputs snapshot.txt at repo root
-```
+# Full repo (default)
+make full-snapshot        # -> snapshot.txt
+
+# Just the backend
+make backend-snapshot     # -> snapshot-backend.txt
+
+# Just the frontend
+make frontend-snapshot    # -> snapshot-frontend.txt
+
+# Everything except backend/frontend (scaffolding, configs, tools, etc.)
+make meta-snapshot        # -> snapshot-meta.txt
+
+# Back-compat alias
+make rv-snapshot          # -> snapshot.txt
+
 
 ## Data persistence
 
@@ -38,5 +52,4 @@ volumes:
 
 
 ## Next steps
-- Add SQLite + polling worker and store summaries/priorities.
 - Add “Generate draft” button that APPENDs to IMAP Drafts.
