@@ -1,5 +1,6 @@
+# backend/pyproject.toml
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -13,10 +14,13 @@ dependencies = [
   "python-dotenv>=1.0",
   "pydantic>=2.7",
   "beautifulsoup4>=4.12",
-  "imapclient>=3.0",  # optional; using imaplib in code for portability
+  "imapclient>=3.0",  # optional; code currently uses imaplib
 ]
 
 [tool.setuptools]
-package-dir = {"backend" = "app"}
-packages = ["backend.app"]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["inbox_backend*"]
 

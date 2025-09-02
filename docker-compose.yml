@@ -9,7 +9,9 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     network_mode: bridge
-    command: ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    command: ["uvicorn", "inbox_backend.app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
   frontend:
     build: ./frontend

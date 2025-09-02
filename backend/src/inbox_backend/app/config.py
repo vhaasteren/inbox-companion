@@ -9,6 +9,7 @@ class Settings(BaseModel):
     imap_pass: str = os.getenv("IMAP_PASS", "")
     imap_mailbox: str = os.getenv("IMAP_MAILBOX", "INBOX")
     imap_use_starttls: bool = os.getenv("IMAP_USE_STARTTLS", "true").lower() == "true"
+    imap_tls_verify: bool = os.getenv("IMAP_TLS_VERIFY", "true").lower() == "true"
 
     cors_origins: list[str] = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
     ollama_url: str = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")

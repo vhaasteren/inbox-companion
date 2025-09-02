@@ -28,8 +28,15 @@ def preview(limit: int = 10) -> dict:
     mailbox = settings.imap_mailbox
 
     client = imaplib.IMAP4(host, port)
+    #if settings.imap_use_starttls:
+    #    context = ssl.create_default_context()
+    #    client.starttls(ssl_context=context)
     if settings.imap_use_starttls:
         context = ssl.create_default_context()
+        if not settings.imap_tls_verify:
+            # Dev-only: accept self-signed (no hostname/CAs). ⚠️ Do NOT use in prod.
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
         client.starttls(ssl_context=context)
 
     client.login(settings.imap_user, settings.imap_pass)
