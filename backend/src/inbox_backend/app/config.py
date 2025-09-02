@@ -36,6 +36,9 @@ class Settings(BaseModel):
     cors_origins: list[str] = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
     ollama_url: str = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 
+    # System prompt
+    system_prompt_summary_path: str = "/state/system_prompt_summary.txt"
+
 
 settings = Settings()
 

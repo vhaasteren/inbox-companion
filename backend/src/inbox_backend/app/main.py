@@ -1,40 +1,32 @@
 from __future__ import annotations
 from typing import Optional, List, Dict, Any
-
+import asyncio
 import hashlib
 import json
-import logging
 from datetime import datetime
+from pathlib import Path
+import uuid
 
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
-
-from sqlalchemy import text
+from sqlalchemy import text, select, func
 
 from .config import settings
 from .imap_preview import preview as imap_preview
 from .db import session_scope, engine
-from .models import Message
+from .models import Message, MessageAnalysis, Label, MemoryItem
 from .repository import (
     get_recent_messages, search_messages, get_message_body,
     list_labels, upsert_label, labels_for_message,
     get_backlog, get_analysis, upsert_analysis, apply_labels,
     list_memory, upsert_memory, compose_allowed_labels,
+    find_message_ids_missing_analysis,
 )
 from .poller import start_scheduler, poll_once, backfill_since_days
-from .llm_client import chat_json, SYSTEM_SUMMARY_PROMPT, build_summary_user_prompt, compose_memory_block, ping_models
+from .llm_client import chat_json, get_system_summary_prompt, build_summary_user_prompt, compose_memory_block, ping_models
 
-# Logger
-logger = logging.getLogger("inbox")
-if not logger.handlers:
-    h = logging.StreamHandler()
-    fmt = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s")
-    h.setFormatter(fmt)
-    logger.addHandler(h)
-logger.setLevel(logging.INFO)
-
-app = FastAPI(title="Inbox Companion API", version="0.3.4")
+app = FastAPI(title="Inbox Companion API", version="0.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,6 +37,60 @@ app.add_middleware(
 )
 
 _scheduler = None
+
+def _has_meaningful_summary(row: MessageAnalysis) -> bool:
+    """True only when there is a usable, non-empty summary and no last_error."""
+    if not row:
+        return False
+    if getattr(row, "last_error", None):  # any recorded error means not meaningful
+        return False
+    s = (row.summary_json or "").strip()
+    if not s or s in ("{}", "[]", "null"):
+        return False
+    try:
+        obj = json.loads(s)
+    except Exception:
+        return False
+    if not isinstance(obj, dict):
+        return False
+
+    has_content = bool(obj.get("bullets")) or bool(obj.get("key_actions")) \
+        or int(obj.get("importance") or 0) or int(obj.get("urgency") or 0) \
+        or int(obj.get("priority") or 0) or bool(obj.get("labels"))
+    return has_content
+
+
+def _export_message_fields(msg: Message) -> dict:
+    """Copy only the fields we need so we don't touch a detached instance later."""
+    return {
+        "subject": msg.subject or "",
+        "from_name": (msg.from_name or "") or (msg.from_raw or ""),
+        "from_email": msg.from_email or "",
+        "date_iso": msg.date_iso or "",
+        "from_raw": msg.from_raw or "",
+        "body_preview": msg.body_preview or "",
+    }
+
+# --------------------
+# State dir / user-info prompt
+# --------------------
+
+def _state_dir() -> Path:
+    sd = getattr(settings, "state_dir", None) or Path("/state")
+    return Path(sd)
+
+def _read_user_info_prompt() -> str:
+    """
+    If /state/user_info.txt exists (or STATE_DIR/user_info.txt), read and return.
+    This is prepended to the LLM system prompt.
+    """
+    try:
+        p = _state_dir() / "user_info.txt"
+        if p.exists() and p.is_file():
+            return p.read_text(encoding="utf-8")
+    except Exception:
+        pass
+    return ""
 
 
 @app.on_event("startup")
@@ -100,10 +146,10 @@ async def api_messages_recent(limit: int = Query(50, ge=1, le=200)):
 
 
 class BackfillRequest(BaseModel):
-    mailbox: Optional[str] = None   # default: all mailboxes
-    days: int                       # SINCE <days> (e.g., 400 to go further back)
+    mailbox: Optional[str] = None
+    days: int
     only_unseen: bool = True
-    limit: Optional[int] = None     # process at most N UIDs (oldest first)
+    limit: Optional[int] = None
 
 
 @app.post("/api/backfill")
@@ -120,9 +166,6 @@ async def api_backfill(req: BackfillRequest):
 
 @app.post("/api/refresh")
 async def api_refresh_now():
-    """
-    Manually trigger one poll cycle across configured mailboxes.
-    """
     summary = poll_once()
     return summary
 
@@ -198,7 +241,7 @@ class MemoryItemIn(BaseModel):
     key: str
     value: str
     weight: int = 0
-    expires_at: Optional[str] = None  # ISO timestamp or None
+    expires_at: Optional[str] = None
 
     @validator("kind")
     def _kind_ok(cls, v: str) -> str:
@@ -253,6 +296,7 @@ async def api_memory_upsert(item: MemoryItemIn):
 class SummarizeIn(BaseModel):
     ids: List[int] = Field(default_factory=list)
     model: Optional[str] = None
+    force: bool = False
 
 
 class AnalysisOut(BaseModel):
@@ -266,7 +310,7 @@ class AnalysisOut(BaseModel):
     labels: List[str] = Field(default_factory=list)
     confidence: float = 0.0
     truncated: bool = False
-    model: str = "deepseek-r1:32b"
+    model: str = "deepseek-r1:8b"
     token_usage: Dict[str, int] = Field(default_factory=lambda: {"prompt": 0, "completion": 0})
     notes: Optional[str] = ""
 
@@ -286,125 +330,167 @@ def _normalize_body(subject: str, from_name: str, from_email: str, date: Optiona
     return "\n".join(parts).strip()
 
 
+def _compose_system_prompt_with_user_info() -> str:
+    """
+    Prepend user-specific info from /state/user_info.txt (if present) to the system prompt.
+    """
+    user_info = _read_user_info_prompt().strip()
+    if not user_info:
+        return get_system_summary_prompt()
+    return f"{user_info}\n\n{get_system_summary_prompt()}"
+
+
+async def summarize_one_id(mid: int, model: Optional[str] = None, force: bool = False) -> Dict[str, Any]:
+    # ------- Load things inside session -------
+    with session_scope() as s:
+        msg = s.get(Message, mid)
+        if not msg:
+            return {"id": mid, "status": "not_found"}
+
+        export = _export_message_fields(msg)
+        body = get_message_body(s, mid) or export["body_preview"] or ""
+
+        # Build normalized text for hashing/clip
+        text = _normalize_body(
+            export["subject"],
+            export["from_name"],
+            export["from_email"],
+            export["date_iso"],
+            body,
+        )
+        truncated = False
+        max_chars = int(getattr(settings, "llm_max_chars", 20000))
+        if len(text) > max_chars:
+            text = text[:max_chars]
+            truncated = True
+
+        current_hash = _hash_text(text)
+        existing = get_analysis(s, mid)
+
+        # Only skip when: same hash, NOT forced, and existing is meaningful
+        if existing and existing.body_hash == current_hash and not force and _has_meaningful_summary(existing):
+            try:
+                data = json.loads(existing.summary_json)
+                return {"id": mid, "status": "ok", "analysis": data, "skipped": True}
+            except Exception:
+                # fallthrough to regenerate if stored JSON is corrupted
+                pass
+
+        allowed = compose_allowed_labels(s)
+        mem_items = list_memory(s)
+        mem_block = compose_memory_block(
+            [{"kind": m.kind, "key": m.key, "value": m.value} for m in mem_items], max_chars=3000
+        )
+
+    # ------- Outside session (no ORM access) -------
+    system = _compose_system_prompt_with_user_info()
+    user = build_summary_user_prompt(
+        allowed_labels=allowed,
+        memory_block=mem_block,
+        subject=export["subject"],
+        from_name=export["from_name"],
+        from_email=export["from_email"],
+        date=export["date_iso"],
+        body_text=body if not truncated else body[:max_chars],
+        truncated=truncated,
+    )
+
+    obj, usage, err = await chat_json(system, user, model=model)
+    if err or obj is None:
+        # Persist a row with last_error so we don't silently succeed
+        with session_scope() as s:
+            upsert_analysis(s, mid, current_hash, "", error=err or "unknown error")
+        return {"id": mid, "status": "error", "error": err or "unknown error"}
+
+    out = AnalysisOut(**{
+        "version": int(obj.get("version", 2) or 2),
+        "lang": obj.get("lang", "en") or "en",
+        "bullets": [b for b in (obj.get("bullets") or [])][:3],
+        "key_actions": [a for a in (obj.get("key_actions") or [])][:3],
+        "urgency": int(obj.get("urgency", 0) or 0),
+        "importance": int(obj.get("importance", 0) or 0),
+        "priority": 0,
+        "labels": [l for l in (obj.get("labels") or [])][:3],
+        "confidence": float(obj.get("confidence", 0.0) or 0.0),
+        "truncated": bool(obj.get("truncated", truncated)),
+        "model": model or getattr(settings, "llm_model_summary", "deepseek-r1:8b"),
+        "token_usage": {"prompt": int(usage.get("prompt", 0)), "completion": int(usage.get("completion", 0))},
+        "notes": obj.get("notes", "") or "",
+    })
+
+    with session_scope() as s:
+        upsert_analysis(s, mid, current_hash, json.dumps(out.dict()), error=None)
+        apply_labels(s, mid, out.labels)
+
+    return {"id": mid, "status": "ok", "analysis": out.dict()}
+
+
 @app.post("/api/llm/summarize")
 async def api_llm_summarize(payload: SummarizeIn):
     if not payload.ids:
         raise HTTPException(status_code=400, detail="ids must be a non-empty list")
 
     results = []
-    model = payload.model or getattr(settings, "llm_model_summary", "deepseek-r1:32b")
-
-    async def summarize_one(mid: int) -> Dict[str, Any]:
-        # 1) Load and MATERIALIZE inside the session
-        with session_scope() as s:
-            msg = s.get(Message, mid)
-            if not msg:
-                return {"id": mid, "status": "not_found"}
-
-            # Gather body text
-            body_text = get_message_body(s, mid) or (msg.body_preview or "")
-            msg_data = {
-                "subject": msg.subject or "",
-                "from_name": msg.from_name or (msg.from_raw or ""),
-                "from_email": msg.from_email or "",
-                "date": msg.date_iso or "",
-            }
-
-            # Build normalized text for hashing & truncation
-            text_for_hash = _normalize_body(
-                msg_data["subject"], msg_data["from_name"], msg_data["from_email"], msg_data["date"], body_text
-            )
-
-            truncated = False
-            max_chars = int(getattr(settings, "llm_max_chars", 20000))
-            clipped_text = text_for_hash
-            if len(clipped_text) > max_chars:
-                clipped_text = clipped_text[:max_chars]
-                truncated = True
-
-            current_hash = _hash_text(clipped_text)
-            existing = get_analysis(s, mid)
-
-            # Decide whether to skip:
-            # Skip ONLY if we have the same hash AND a non-empty summary_json AND no last_error.
-            if existing and existing.body_hash == current_hash:
-                try:
-                    parsed = json.loads(existing.summary_json or "{}")
-                except Exception:
-                    parsed = {}
-                has_nonempty = isinstance(parsed, dict) and len(parsed.keys()) > 0
-                if has_nonempty and not existing.last_error:
-                    return {"id": mid, "status": "ok", "analysis": parsed, "skipped": True}
-                # otherwise: fall through and re-run the model
-
-            # Compose allowed labels and memory block while session is open
-            allowed = compose_allowed_labels(s)
-            mem_items = list_memory(s)
-            mem_block = compose_memory_block(
-                [{"kind": m.kind, "key": m.key, "value": m.value} for m in mem_items],
-                max_chars=3000,
-            )
-
-        # 2) Call LLM OUTSIDE the session using only primitives
-        system = SYSTEM_SUMMARY_PROMPT
-        user = build_summary_user_prompt(
-            allowed_labels=allowed,
-            memory_block=mem_block,
-            subject=msg_data["subject"],
-            from_name=msg_data["from_name"],
-            from_email=msg_data["from_email"],
-            date=msg_data["date"],
-            body_text=body_text if not truncated else body_text[:max_chars],
-            truncated=truncated,
-        )
-
-        logger.info(f"[LLM] summarize message_id={mid} model={model}")
-        obj, usage, err = await chat_json(system, user, model=model)
-        if err or obj is None:
-            logger.error(f"[LLM] error message_id={mid}: {err}")
-            with session_scope() as s:
-                upsert_analysis(s, mid, current_hash, json.dumps({}), error=err or "unknown error")
-            return {"id": mid, "status": "error", "error": err}
-
-        # 3) Coerce & validate; store; apply labels
-        out = AnalysisOut(**{
-            "version": int(obj.get("version", 2) or 2),
-            "lang": obj.get("lang", "en") or "en",
-            "bullets": [b for b in (obj.get("bullets") or [])][:3],
-            "key_actions": [a for a in (obj.get("key_actions") or [])][:3],
-            "urgency": int(obj.get("urgency", 0) or 0),
-            "importance": int(obj.get("importance", 0) or 0),
-            "priority": 0,  # derived elsewhere if needed
-            "labels": [l for l in (obj.get("labels") or [])][:3],
-            "confidence": float(obj.get("confidence", 0.0) or 0.0),
-            "truncated": bool(obj.get("truncated", truncated)),
-            "model": model,
-            "token_usage": {"prompt": int(usage.get("prompt", 0)), "completion": int(usage.get("completion", 0))},
-            "notes": obj.get("notes", "") or "",
-        })
-
-        with session_scope() as s:
-            upsert_analysis(s, mid, current_hash, json.dumps(out.dict()), error=None)
-            apply_labels(s, mid, out.labels)
-
-        logger.info(f"[LLM] ok message_id={mid} prompt_tokens={out.token_usage.get('prompt',0)} "
-                    f"completion_tokens={out.token_usage.get('completion',0)}")
-        return {"id": mid, "status": "ok", "analysis": out.dict()}
-
-    # Process sequentially
     ok = skipped = errors = 0
+
     for mid in payload.ids:
-        res = await summarize_one(mid)
-        status = res.get("status")
-        if status == "ok" and res.get("skipped"):
-            skipped += 1
-        elif status == "ok":
-            ok += 1
-        else:
-            errors += 1
+        try:
+            # now pass force through
+            res = await summarize_one_id(mid, model=payload.model, force=payload.force)
+        except Exception as e:
+            res = {"id": mid, "status": "error", "error": f"internal: {e.__class__.__name__}: {e}"}
+
         results.append(res)
+        if res.get("status") == "ok":
+            if res.get("skipped"):
+                skipped += 1
+            else:
+                ok += 1
+        elif res.get("status") == "error":
+            errors += 1
 
     return {"results": results, "summary": {"ok": ok, "skipped": skipped, "errors": errors}}
+
+
+class SummarizeAllIn(BaseModel):
+    only_unread: bool = False
+    limit: Optional[int] = None     # None = no limit
+    mailbox: Optional[str] = None
+    model: Optional[str] = None
+
+
+@app.post("/api/llm/summarize_all")
+async def api_llm_summarize_all(payload: SummarizeAllIn):
+    # 1) Find unsummarized message ids
+    with session_scope() as s:
+        stmt = (
+            select(Message.id)
+            .join(MessageAnalysis, MessageAnalysis.message_id == Message.id, isouter=True)
+            .where(
+                (MessageAnalysis.message_id == None) |
+                (func.length(func.coalesce(MessageAnalysis.summary_json, "")) == 0)
+            )
+        )
+        if payload.only_unread:
+            stmt = stmt.where(Message.is_unread == 1)
+        if payload.mailbox:
+            stmt = stmt.where(Message.mailbox == payload.mailbox)
+        stmt = stmt.order_by(func.coalesce(Message.date_iso, "").desc(), Message.id.desc())
+        if payload.limit is not None:
+            stmt = stmt.limit(int(payload.limit))
+
+        ids = [row[0] for row in s.execute(stmt).all()]
+
+    # 2) Run sequentially (safe & simple)
+    results = []
+    for mid in ids:
+        res = await summarize_one_id(mid, model=payload.model)
+        results.append(res)
+
+    ok = sum(1 for r in results if r.get("status") == "ok" and not r.get("skipped"))
+    skipped = sum(1 for r in results if r.get("status") == "ok" and r.get("skipped"))
+    errors = sum(1 for r in results if r.get("status") == "error")
+    return {"count": len(ids), "results": results, "summary": {"ok": ok, "skipped": skipped, "errors": errors}}
 
 
 @app.get("/api/messages/{message_id}/analysis")
@@ -418,24 +504,40 @@ async def api_get_analysis(message_id: int):
         except Exception:
             data = {}
         labs = labels_for_message(s, message_id)
-        err = row.last_error or None
+        err = row.last_error if row else None
     return {"message_id": message_id, "analysis": data, "labels": labs, "error": err}
 
 
-# Small inspect helper to see stored error/hash
+@app.delete("/api/messages/{message_id}/analysis")
+async def api_delete_analysis(message_id: int):
+    with session_scope() as s:
+        row = s.query(MessageAnalysis).filter_by(message_id=message_id).one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="No analysis to delete")
+        s.delete(row)
+        s.commit()
+    return {"ok": True}
+
+
 @app.get("/api/llm/inspect/{message_id}")
 async def api_llm_inspect(message_id: int):
     with session_scope() as s:
         row = get_analysis(s, message_id)
-        if not row:
-            raise HTTPException(status_code=404, detail="No analysis row")
+    if not row:
         return {
             "message_id": message_id,
-            "has_summary": bool(row.summary_json),
-            "last_error": row.last_error,
-            "body_hash": row.body_hash,
-            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+            "has_summary": False,
+            "last_error": None,
+            "body_hash": None,
+            "updated_at": None,
         }
+    return {
+        "message_id": message_id,
+        "has_summary": bool(row.summary_json),
+        "last_error": row.last_error,
+        "body_hash": row.body_hash,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
 
 
 # --------------------
@@ -485,3 +587,147 @@ async def api_llm_ping():
     ok, models, err = await ping_models()
     return {"ok": ok, "models": models, "error": err}
 
+
+# --------------------
+# Batch summarize job with progress
+# --------------------
+
+class JobStatus(BaseModel):
+    job_id: str
+    state: str  # queued|running|done|error
+    total: int
+    processed: int
+    ok: int
+    skipped: int
+    errors: int
+    last_message_id: Optional[int] = None
+    last_error: Optional[str] = None
+    started_at: str
+    finished_at: Optional[str] = None
+    recent: List[Dict[str, Any]] = Field(default_factory=list)  # up to 20 recent results
+
+
+_JOBS: Dict[str, JobStatus] = {}
+
+async def _run_summarize_missing(job: JobStatus, only_unread: bool, limit: int, batch_size: int = 10):
+    job.state = "running"
+    try:
+        with session_scope() as s:
+            ids = find_message_ids_missing_analysis(s, only_unread=only_unread, limit=limit)
+        job.total = len(ids)
+
+        # Process in batches to avoid huge payloads
+        for i in range(0, len(ids), batch_size):
+            chunk = ids[i : i + batch_size]
+            # Call the existing in-process summarize logic
+            # Build a fake payload to reuse our function
+            payload = SummarizeIn(ids=chunk)
+            res = await api_llm_summarize(payload)  # type: ignore
+            data = res if isinstance(res, dict) else res.dict()
+            results = data.get("results", [])
+
+            for r in results:
+                job.processed += 1
+                job.last_message_id = r.get("id")
+                if r.get("status") == "ok":
+                    if r.get("skipped"):
+                        job.skipped += 1
+                    else:
+                        job.ok += 1
+                elif r.get("status") == "error":
+                    job.errors += 1
+                    job.last_error = r.get("error")
+
+                job.recent.append(r)
+                if len(job.recent) > 20:
+                    job.recent = job.recent[-20:]
+
+        job.state = "done"
+        job.finished_at = datetime.utcnow().isoformat()
+    except Exception as e:
+        job.state = "error"
+        job.last_error = str(e)
+        job.finished_at = datetime.utcnow().isoformat()
+
+
+@app.post("/api/llm/summarize_missing")
+async def api_llm_summarize_missing(
+    limit: int = Query(1000, ge=1, le=5000),
+    only_unread: bool = Query(False),
+):
+    """
+    Start a background job to summarize all messages that don't have a stored analysis.
+    Returns a job_id for progress polling.
+    """
+    job_id = uuid.uuid4().hex
+    job = JobStatus(
+        job_id=job_id,
+        state="queued",
+        total=0,
+        processed=0,
+        ok=0,
+        skipped=0,
+        errors=0,
+        started_at=datetime.utcnow().isoformat(),
+    )
+    _JOBS[job_id] = job
+
+    asyncio.create_task(_run_summarize_missing(job, only_unread=only_unread, limit=limit))
+    return {"job_id": job_id}
+
+
+@app.get("/api/llm/jobs/{job_id}")
+async def api_llm_job_status(job_id: str):
+    job = _JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job.dict()
+
+@app.get("/api/llm/jobs")
+async def api_llm_jobs_list(kind: Optional[str] = None):
+    """
+    Return all known jobs (optionally filtered by kind), newest first.
+    Each job includes computed 'remaining' and 'pct' for convenience.
+    Works whether _JOBS values are dicts or Pydantic models.
+    """
+    def _as_dict(obj) -> dict:
+        # Normalize whatever we stored into a plain dict
+        if isinstance(obj, dict):
+            return dict(obj)
+        # Pydantic v2
+        if hasattr(obj, "model_dump"):
+            return obj.model_dump()
+        # Pydantic v1
+        if hasattr(obj, "dict"):
+            return obj.dict()
+        # Fallback to attrs
+        return {k: getattr(obj, k) for k in dir(obj) if not k.startswith("_") and not callable(getattr(obj, k))}
+
+    out = []
+    # Snapshot to avoid mutation while iterating
+    for job_id, info in list(_JOBS.items()):
+        row = _as_dict(info)
+
+        # Optional filter by kind
+        if kind and (row.get("kind") != kind):
+            continue
+
+        row["job_id"] = job_id
+
+        total = row.get("total") or 0
+        ok = int(row.get("ok") or 0)
+        skipped = int(row.get("skipped") or 0)
+        errors = int(row.get("errors") or 0)
+
+        remaining = None
+        if isinstance(total, int):
+            remaining = max(0, total - ok - skipped - errors)
+
+        row["remaining"] = remaining
+        row["pct"] = round(((ok + skipped + errors) / total) * 100.0, 1) if isinstance(total, int) and total > 0 else None
+
+        out.append(row)
+
+    # Sort by created_at desc if present
+    out.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+    return {"jobs": out}

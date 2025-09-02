@@ -571,7 +571,8 @@ export default function App() {
     setInFlightIds((s) => new Set([...Array.from(s), id]))
     try {
       setBanner('Talking to LLM…')
-      const resp = await summarize([id])
+      const resp = await summarize([id], { force: true }) // <-- force manual retries
+
       // Record per-row errors for visibility
       for (const r of resp.results) {
         if (r.status === 'error') {
@@ -584,6 +585,7 @@ export default function App() {
         }
       }
       eatSummarizeResultsIntoBanner(resp.results)
+
       // then fetch stored analysis
       await loadAnalysisOnly(id)
     } catch (e: any) {
@@ -607,7 +609,7 @@ export default function App() {
       setSummarizing(true)
       setBanner('Talking to LLM…')
 
-      const resp = await summarize(visibleIds.slice(0, 50)) // modest cap to keep UI responsive
+      const resp = await summarize(visibleIds.slice(0, 50), { force: false }) // <-- skip valid ones
 
       // Update error map immediately
       for (const r of resp.results) {

@@ -123,8 +123,6 @@ def get_recent_uids(session: Session, mailbox: str, limit: int) -> list[int]:
 def search_messages(session: Session, q: str, limit: int = 50) -> list[Message]:
     """
     Full-text search using FTS5 over (subject, from_raw, snippet, body_preview).
-    We cannot alias the FTS table on the left side of MATCH in SQLite, so we must
-    refer to it by its real name.
     """
     try:
         id_rows = session.execute(text("""
@@ -136,7 +134,6 @@ def search_messages(session: Session, q: str, limit: int = 50) -> list[Message]:
             LIMIT :lim
         """), {"q": q, "lim": int(limit)}).fetchall()
     except OperationalError:
-        # Fallback if FTS is unavailable in this DB for any reason
         id_rows = session.execute(text("""
             SELECT id FROM message
             WHERE subject LIKE :like
@@ -222,7 +219,6 @@ def upsert_label(session: Session, name: str, color: Optional[str] = None, weigh
 def apply_labels(session: Session, message_id: int, label_names: List[str]) -> None:
     if label_names is None:
         return
-    # Ensure labels exist
     name_to_id: Dict[str, int] = {}
     for nm in label_names:
         nm = (nm or "").strip()
@@ -235,7 +231,6 @@ def apply_labels(session: Session, message_id: int, label_names: List[str]) -> N
             session.flush()
         name_to_id[nm] = lab.id
 
-    # Replace mapping
     session.execute(delete(MessageLabel).where(MessageLabel.message_id == message_id))
     for lab_id in name_to_id.values():
         session.add(MessageLabel(message_id=message_id, label_id=lab_id))
@@ -307,7 +302,6 @@ def compose_allowed_labels(session: Session) -> List[str]:
 # ---------------------
 
 def _derive_priority(importance: int, urgency: int) -> int:
-    # priority = round((2*importance + urgency)/3 * 20) -> 0..100
     importance = max(0, min(int(importance), 5))
     urgency = max(0, min(int(urgency), 5))
     score = (2 * importance + urgency) / 3.0
@@ -321,10 +315,6 @@ def get_backlog(
     min_priority: int = 0,
     only_unread: bool = False,
 ) -> List[Tuple[Message, Optional[MessageAnalysis], int]]:
-    """
-    Return (Message, Analysis, derived_priority) sorted by derived_priority desc, date desc.
-    """
-    # Join message + analysis ids; we’ll compute priority in Python from summary_json
     stmt = select(Message, MessageAnalysis).join(
         MessageAnalysis, MessageAnalysis.message_id == Message.id, isouter=True
     )
@@ -348,7 +338,71 @@ def get_backlog(
         if pr >= int(min_priority or 0):
             out.append((msg, an, pr))
 
-    # Sort and paginate
     out.sort(key=lambda t: (t[2], t[0].date_iso or "", t[0].id), reverse=True)
     return out[offset: offset + limit]
 
+
+# ---------------------
+# Missing-analysis query (for batch summarize)
+# ---------------------
+
+def find_message_ids_missing_analysis(
+    session: Session,
+    only_unread: bool = False,
+    limit: int = 1000,
+) -> List[int]:
+    """
+    Return message IDs that have NO analysis, or an empty/garbage summary_json,
+    or had a previous last_error (so we can retry).
+    """
+    # Subquery of message_ids that are considered "good" (meaningful) summaries
+    # We keep this simple: non-null, length > 2 AND not one of '{}', '[]', 'null' (case-insensitive-ish).
+    good_ids = session.execute(text("""
+        SELECT ma.message_id
+        FROM message_analysis AS ma
+        WHERE ma.last_error IS NULL
+          AND ma.summary_json IS NOT NULL
+          AND LENGTH(TRIM(ma.summary_json)) > 2
+          AND TRIM(ma.summary_json) NOT IN ('{}','[]','null','NULL')
+    """)).fetchall()
+    good_set = {r[0] for r in good_ids}
+
+    # Candidate messages (recent-ish ordering; keep your ordering preference)
+    stmt = select(Message.id)
+    if only_unread:
+        stmt = stmt.where(Message.is_unread == 1)
+    stmt = stmt.order_by(func.coalesce(Message.date_iso, "").desc(), Message.id.desc()).limit(limit * 3)
+    candidates = [r[0] for r in session.execute(stmt).fetchall()]
+
+    # Filter out those with good summaries; include those with missing or error/empty summaries
+    missing: List[int] = []
+    if not candidates:
+        return missing
+
+    # Fast check of analysis rows for the candidates in one go
+    rows = session.execute(
+        select(MessageAnalysis.message_id, MessageAnalysis.summary_json, MessageAnalysis.last_error)
+        .where(MessageAnalysis.message_id.in_(candidates))
+    ).fetchall()
+    by_id = {mid: (sj, le) for (mid, sj, le) in rows}
+
+    for mid in candidates:
+        if mid in good_set:
+            continue
+        sj, le = by_id.get(mid, (None, None))
+        if le is not None:
+            missing.append(mid)        # had an error -> retry
+            continue
+        s = (sj or "").strip()
+        if not s or s in ("{}", "[]", "null", "NULL"):
+            missing.append(mid)        # empty-ish -> retry
+            continue
+        # Extra safety: if JSON is corrupt, retry
+        try:
+            _ = json.loads(s)
+        except Exception:
+            missing.append(mid)
+            continue
+
+    # Apply limit after filtering
+    return missing[: int(limit)]

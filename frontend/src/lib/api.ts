@@ -101,15 +101,22 @@ export async function fetchBody(messageId: number): Promise<{ message_id: number
   return handle(r)
 }
 
-// --- New: LLM analysis ---
+// --- LLM analysis ---
 
-export async function summarize(ids: number[], model?: string): Promise<SummarizeResponse> {
-  const r = await fetch(`${API_BASE}/api/llm/summarize`, {
+export function summarize(
+  ids: number[],
+  opts?: { model?: string | null; force?: boolean }
+): Promise<SummarizeResponse> {
+  const base = (import.meta.env.VITE_API_BASE as string) || 'http://localhost:8000'
+  return fetch(`${base}/api/llm/summarize`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ids, model }),
-  })
-  return handle(r)
+    body: JSON.stringify({
+      ids,
+      model: opts?.model ?? null,
+      force: opts?.force ?? false,
+    }),
+  }).then(handle)
 }
 
 export async function fetchAnalysis(
