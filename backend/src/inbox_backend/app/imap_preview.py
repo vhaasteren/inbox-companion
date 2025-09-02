@@ -5,6 +5,7 @@ import hashlib
 import re
 import ssl
 from email.header import decode_header
+from email.utils import parseaddr
 
 from .config import settings
 
@@ -25,61 +26,81 @@ def _decode_mime_words(s: str | None) -> str:
     return "".join(out)
 
 
-def _clean_plain_text(msg: email.message.Message) -> str:
-    """
-    Extract a light plain-text representation: prefer 'text/plain',
-    fallback to stripped 'text/html'.
-    """
-    # Prefer text/plain
-    if msg.is_multipart():
-        for part in msg.walk():
-            ctype = part.get_content_type()
-            if ctype == "text/plain":
-                try:
-                    return part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", "replace")
-                except Exception:
-                    continue
-
-    # Fallback: text/plain (single part)
-    if msg.get_content_type() == "text/plain":
-        try:
-            return msg.get_payload(decode=True).decode(msg.get_content_charset() or "utf-8", "replace")
-        except Exception:
-            pass
-
-    # Fallback: text/html → strip tags minimally
-    if msg.is_multipart():
-        for part in msg.walk():
-            ctype = part.get_content_type()
-            if ctype == "text/html":
-                try:
-                    html = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", "replace")
-                    return _strip_html(html)
-                except Exception:
-                    continue
-    elif msg.get_content_type() == "text/html":
-        try:
-            html = msg.get_payload(decode=True).decode(msg.get_content_charset() or "utf-8", "replace")
-            return _strip_html(html)
-        except Exception:
-            pass
-
-    # Last resort: empty
-    return ""
-
-
 def _strip_html(html: str) -> str:
-    # extremely light stripping (no bs4 to keep deps minimal in this module)
-    text = re.sub(r"(?is)<(script|style).*?>.*?</\\1>", "", html)
-    text = re.sub(r"(?is)<br\\s*/?>", "\n", text)
+    text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", "", html)
+    text = re.sub(r"(?is)<br\s*/?>", "\n", text)
     text = re.sub(r"(?is)</p>", "\n", text)
     text = re.sub(r"(?is)<.*?>", "", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
+def _clean_plain_text(msg: email.message.Message) -> str:
+    """
+    Prefer 'text/plain' parts (no attachments). Fallback to stripped 'text/html'.
+    Concatenate multiple text/plain parts.
+    """
+    texts: list[str] = []
+
+    if msg.is_multipart():
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            disp = (part.get("Content-Disposition") or "").lower()
+            if "attachment" in disp:
+                continue
+            if ctype == "text/plain":
+                try:
+                    payload = part.get_payload(decode=True) or b""
+                    texts.append(payload.decode(part.get_content_charset() or "utf-8", "replace"))
+                except Exception:
+                    continue
+
+    if texts:
+        return "\n\n".join(t.strip() for t in texts if t.strip())
+
+    # Single-part plain text
+    if msg.get_content_type() == "text/plain":
+        try:
+            return (msg.get_payload(decode=True) or b"").decode(msg.get_content_charset() or "utf-8", "replace")
+        except Exception:
+            pass
+
+    # Fallback: HTML
+    html = None
+    if msg.is_multipart():
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            disp = (part.get("Content-Disposition") or "").lower()
+            if "attachment" in disp:
+                continue
+            if ctype == "text/html":
+                try:
+                    html = (part.get_payload(decode=True) or b"").decode(part.get_content_charset() or "utf-8", "replace")
+                    break
+                except Exception:
+                    continue
+    elif msg.get_content_type() == "text/html":
+        try:
+            html = (msg.get_payload(decode=True) or b"").decode(msg.get_content_charset() or "utf-8", "replace")
+        except Exception:
+            pass
+
+    return _strip_html(html or "")
+
+
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _flags_from_resp(flags_tuple: tuple[str, ...]) -> tuple[int, int, int]:
+    """
+    Map IMAP flags to (is_unread, is_answered, is_flagged) as 1/0.
+    """
+    flags_str = " ".join(flags_tuple).upper()
+    seen = "\\SEEN" in flags_str
+    answered = "\\ANSWERED" in flags_str
+    flagged = "\\FLAGGED" in flags_str
+    return (0 if seen else 1, 1 if answered else 0, 1 if flagged else 0)
 
 
 def preview(limit: int = 10) -> dict:
@@ -110,10 +131,20 @@ def preview(limit: int = 10) -> dict:
         t, msg_data = client.fetch(uid, "(RFC822)")
         if t != "OK":
             continue
+        # FLAGS via separate UID FETCH for robustness
+        tf, fl = client.uid("FETCH", uid, "(FLAGS)")
+        flags = ()
+        if tf == "OK" and fl and isinstance(fl[0], tuple) and isinstance(fl[0][1], (bytes, bytearray)):
+            flag_text = fl[0][1].decode("utf-8", "ignore")
+            flags = tuple(re.findall(r"\\[A-Za-z]+", flag_text))
+        is_unread, is_answered, is_flagged = _flags_from_resp(flags)
+
         raw = msg_data[0][1]
         msg = email.message_from_bytes(raw)
         subject = _decode_mime_words(msg.get("Subject")) or "(no subject)"
-        sender = _decode_mime_words(msg.get("From")) or "(unknown)"
+        sender_raw = _decode_mime_words(msg.get("From")) or "(unknown)"
+        name_decoded = _decode_mime_words(msg.get("From"))
+        name, addr = parseaddr(name_decoded or "")
         date_raw = msg.get("Date")
         try:
             dt = email.utils.parsedate_to_datetime(date_raw) if date_raw else None
@@ -123,9 +154,14 @@ def preview(limit: int = 10) -> dict:
 
         items.append({
             "uid": int(uid),
-            "from": sender,
+            "from": sender_raw,
+            "from_name": name or None,
+            "from_email": addr or None,
             "subject": subject,
             "date": date_iso,
+            "is_unread": is_unread,
+            "is_answered": is_answered,
+            "is_flagged": is_flagged,
         })
 
     client.logout()
@@ -134,37 +170,62 @@ def preview(limit: int = 10) -> dict:
 
 # --- Importer helpers (used by the poller) ---
 
-def fetch_uids_since(client: imaplib.IMAP4, last_uid: int, initial_limit: int | None = None) -> list[bytes]:
+def fetch_uids_since(client: imaplib.IMAP4, last_uid: int, since_str: str | None, only_unseen: bool) -> list[bytes]:
     """
-    Return a list of UIDs to fetch. If last_uid == 0, backfill with last N (initial_limit).
+    Return list of UIDs to fetch.
+    On first run (last_uid<=0): search by (SINCE <date>) and optionally UNSEEN.
+    Otherwise: search by UIDs greater than last_uid and optionally UNSEEN.
     """
-    if last_uid <= 0 and initial_limit:
-        typ, data = client.search(None, "ALL")
-        if typ != "OK":
-            return []
-        all_ids = data[0].split()
-        return all_ids[-initial_limit:]
-    else:
-        typ, data = client.uid("SEARCH", None, f"UID {last_uid + 1}:*")
-        if typ != "OK" or not data or not data[0]:
+    if last_uid <= 0:
+        # Build criteria
+        crit = []
+        if only_unseen:
+            crit.append("UNSEEN")
+        if since_str:
+            crit += ["SINCE", since_str]
+        typ, data = client.search(None, *crit) if crit else client.search(None, "ALL")
+        if typ != "OK" or not data:
             return []
         return data[0].split()
 
+    # Subsequent runs: restrict by UID range
+    if only_unseen:
+        typ, data = client.uid("SEARCH", None, f"UID {last_uid + 1}:*", "UNSEEN")
+    else:
+        typ, data = client.uid("SEARCH", None, f"UID {last_uid + 1}:*")
+    if typ != "OK" or not data or not data[0]:
+        return []
+    return data[0].split()
 
-def fetch_message_by_uid(client: imaplib.IMAP4, uid: bytes) -> tuple[dict, int]:
+
+def fetch_message_by_uid(client: imaplib.IMAP4, mailbox: str, uid: bytes) -> tuple[dict, int]:
     """
-    Fetch and parse one message by UID, return a dict for DB insert and the numeric uid.
+    Fetch and parse one message by UID, return a dict for DB upsert and the numeric uid.
+    Skips attachments for body content.
     """
+    # Get RFC822 + FLAGS robustly (two calls for compatibility)
     t, msg_data = client.uid("FETCH", uid, "(RFC822)")
     if t != "OK" or not msg_data or msg_data[0] is None:
-        raise RuntimeError("UID FETCH failed")
+        raise RuntimeError("UID FETCH RFC822 failed")
+
+    tf, fl = client.uid("FETCH", uid, "(FLAGS)")
+    flags = ()
+    if tf == "OK" and fl and isinstance(fl[0], tuple) and isinstance(fl[0][1], (bytes, bytearray)):
+        flag_text = fl[0][1].decode("utf-8", "ignore")
+        flags = tuple(re.findall(r"\\[A-Za-z]+", flag_text))
+    is_unread, is_answered, is_flagged = _flags_from_resp(flags)
 
     raw = msg_data[0][1]
     msg = email.message_from_bytes(raw)
 
     subject = _decode_mime_words(msg.get("Subject")) or "(no subject)"
-    sender = _decode_mime_words(msg.get("From")) or "(unknown)"
+    sender_raw = _decode_mime_words(msg.get("From")) or "(unknown)"
+    name_decoded = _decode_mime_words(msg.get("From"))
+    name, addr = parseaddr(name_decoded or "")
     message_id = msg.get("Message-ID")
+    in_reply_to = msg.get("In-Reply-To")
+    references_raw = msg.get("References")
+
     date_raw = msg.get("Date")
     try:
         dt = email.utils.parsedate_to_datetime(date_raw) if date_raw else None
@@ -174,15 +235,25 @@ def fetch_message_by_uid(client: imaplib.IMAP4, uid: bytes) -> tuple[dict, int]:
 
     plain = _clean_plain_text(msg).strip()
     snippet = (plain[:250] + "…") if len(plain) > 250 else plain
+    body_preview = plain[:2048] if plain else None
 
     return {
-        "mailbox": settings.imap_mailbox,
+        "mailbox": mailbox,
         "uid": int(uid),
         "message_id": message_id,
         "subject": subject,
-        "from_raw": sender,
+        "from_raw": sender_raw,
+        "from_name": name or None,
+        "from_email": addr or None,
         "date_iso": date_iso,
         "snippet": snippet,
+        "body_preview": body_preview,
+        "body_full": plain,  # stored in separate table
+        "in_reply_to": in_reply_to,
+        "references_raw": references_raw,
+        "is_unread": 1 if is_unread else 0,
+        "is_answered": 1 if is_answered else 0,
+        "is_flagged": 1 if is_flagged else 0,
         "body_hash": _sha256(raw),
     }, int(uid)
 

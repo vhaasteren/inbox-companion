@@ -26,3 +26,11 @@ frontend/dist/
 .vscode/
 .idea/
 *~
+
+
+# Custom files
+bridge-credentials.txt
+curl-api.md
+directory-layout.txt
+frontend/package-lock.json
+test-script.py
