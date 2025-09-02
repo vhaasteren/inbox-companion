@@ -27,6 +27,16 @@ make rv-snapshot
 # Outputs snapshot.txt at repo root
 ```
 
+## Data persistence
+
+The backend writes its SQLite DB to `/data` inside the container. In `docker-compose.yml` this
+is bind-mounted to `./state` on the host:
+
+```yaml
+volumes:
+  - ./state:/data
+
+
 ## Next steps
 - Add SQLite + polling worker and store summaries/priorities.
 - Add “Generate draft” button that APPENDs to IMAP Drafts.

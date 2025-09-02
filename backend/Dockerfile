@@ -5,20 +5,21 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    sqlite3 tzdata ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY pyproject.toml ./
-
-# Ensure egg_base exists so setuptools doesn't fail
 RUN mkdir -p src
-
-# Install dependencies (and a tiny empty wheel for now)
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir .
 
-# Now copy the actual source (this layer changes often)
 COPY src ./src
-
-# Reinstall to include your code (still non-editable)
 RUN pip install --no-cache-dir .
+
+# Hint that /data is where persistent state lives (compose handles the bind)
+VOLUME ["/data"]
 
 EXPOSE 8000
 CMD ["uvicorn", "inbox_backend.app.main:app", "--host", "0.0.0.0", "--port", "8000"]

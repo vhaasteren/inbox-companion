@@ -12,6 +12,7 @@ __pycache__/
 *.patch
 /out/
 snapshot.txt
+state/
 
 
 # Node / frontend

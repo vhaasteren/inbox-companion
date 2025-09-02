@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "inbox-backend"
-version = "0.0.1"
+version = "0.0.2"
 description = "Inbox Companion backend"
 requires-python = ">=3.11"
 dependencies = [
@@ -14,7 +14,9 @@ dependencies = [
   "python-dotenv>=1.0",
   "pydantic>=2.7",
   "beautifulsoup4>=4.12",
-  "imapclient>=3.0",  # optional; code currently uses imaplib
+  "imapclient>=3.0",
+  "SQLAlchemy>=2.0",
+  "APScheduler>=3.10",
 ]
 
 [tool.setuptools]
