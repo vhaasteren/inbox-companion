@@ -40,6 +40,28 @@ make meta-snapshot        # -> snapshot-meta.txt
 # Back-compat alias
 make rv-snapshot          # -> snapshot.txt
 
+### API surface snapshot
+
+Generate a compact “API view” of function/method signatures:
+
+```bash
+make api
+# -> api-snapshot.txt
+
+### Picked-file snapshot
+
+Output just the files you specify (same format as the full snapshot):
+
+```bash
+# Inline list
+make pick-snapshot FILES="backend/src/inbox_backend/app/db.py frontend/src/lib/api.ts"
+
+# From list file
+make pick-snapshot FILELIST=filelist.txt
+
+# Or via stdin
+printf "%s\n" backend/src/inbox_backend/app/main.py frontend/src/App.tsx | make pick-snapshot
+
 
 ## Data persistence
 
