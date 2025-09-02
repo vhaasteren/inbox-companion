@@ -1,0 +1,27 @@
+# Python & general
+*.patch
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.build/
+.venv/
+.env
+*.patch
+/out/
+snapshot.txt
+
+
+# Node / frontend
+node_modules/
+frontend/.vite/
+frontend/dist/
+
+
+# Editor/OS
+.DS_Store
+.vscode/
+.idea/
+*~

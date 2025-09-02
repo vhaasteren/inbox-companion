@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inbox-backend"
+version = "0.0.1"
+description = "Inbox Companion backend"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.29",
+  "python-dotenv>=1.0",
+  "pydantic>=2.7",
+  "beautifulsoup4>=4.12",
+  "imapclient>=3.0",  # optional; using imaplib in code for portability
+]
+
+[tool.setuptools]
+package-dir = {"backend" = "app"}
+packages = ["backend.app"]
+
