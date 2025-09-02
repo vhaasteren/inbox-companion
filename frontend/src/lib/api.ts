@@ -21,6 +21,32 @@ export type RecentResponse = {
   items: RecentItem[]
 }
 
+export type Analysis = {
+  version: number
+  lang: string
+  bullets: string[]
+  key_actions: string[]
+  urgency: number
+  importance: number
+  priority: number
+  labels: string[]
+  confidence: number
+  truncated: boolean
+  model: string
+  token_usage: { prompt: number; completion: number }
+  notes?: string
+}
+
+export type SummarizeResult =
+  | { id: number; status: 'ok'; skipped?: boolean; analysis?: Analysis }
+  | { id: number; status: 'not_found' }
+  | { id: number; status: 'error'; error?: string }
+
+export type SummarizeResponse = {
+  results: SummarizeResult[]
+  summary?: { ok: number; skipped: number; errors: number }
+}
+
 const API_BASE = (import.meta.env.VITE_API_BASE as string) || 'http://localhost:8000'
 
 async function handle(r: Response) {
@@ -72,6 +98,51 @@ export async function search(q: string, limit = 50): Promise<RecentResponse> {
 
 export async function fetchBody(messageId: number): Promise<{ message_id: number; body: string }> {
   const r = await fetch(`${API_BASE}/api/messages/${messageId}/body`)
+  return handle(r)
+}
+
+// --- New: LLM analysis ---
+
+export async function summarize(ids: number[], model?: string): Promise<SummarizeResponse> {
+  const r = await fetch(`${API_BASE}/api/llm/summarize`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids, model }),
+  })
+  return handle(r)
+}
+
+export async function fetchAnalysis(
+  messageId: number
+): Promise<{ message_id: number; analysis: Analysis; labels: string[]; error?: string | null }> {
+  const r = await fetch(`${API_BASE}/api/messages/${messageId}/analysis`)
+  return handle(r)
+}
+
+export type BacklogItem = RecentItem & { priority: number; has_analysis: boolean }
+
+export async function fetchBacklog(
+  limit = 50,
+  min_priority = 0,
+  only_unread = false
+): Promise<{ items: BacklogItem[] }> {
+  const url = new URL(`${API_BASE}/api/backlog`)
+  url.searchParams.set('limit', String(limit))
+  url.searchParams.set('min_priority', String(min_priority))
+  url.searchParams.set('only_unread', String(!!only_unread))
+  const r = await fetch(url.toString())
+  return handle(r)
+}
+
+export async function llmPing(): Promise<{ ok: boolean; models: string[]; error?: string | null }> {
+  const r = await fetch(`${API_BASE}/api/llm/ping`)
+  return handle(r)
+}
+
+export async function llmInspect(
+  messageId: number
+): Promise<{ message_id: number; has_summary: boolean; last_error: string | null; body_hash: string | null; updated_at: string | null }> {
+  const r = await fetch(`${API_BASE}/api/llm/inspect/${messageId}`)
   return handle(r)
 }
 

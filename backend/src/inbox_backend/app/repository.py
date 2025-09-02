@@ -1,13 +1,17 @@
 from __future__ import annotations
 from datetime import datetime
-from typing import Iterable, Optional, Sequence, List, Dict
+from typing import Iterable, Optional, Sequence, List, Dict, Tuple
 
-from sqlalchemy import select, func, text
+from sqlalchemy import select, func, text, delete
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import OperationalError
 
-from .models import Mailbox, Message, MessageBody
+from .models import Mailbox, Message, MessageBody, MessageAnalysis, Label, MessageLabel, MemoryItem
 
+
+# ---------------------
+# Existing primitives
+# ---------------------
 
 def ensure_mailbox(session: Session, name: str) -> Mailbox:
     mb = session.execute(select(Mailbox).where(Mailbox.name == name)).scalar_one_or_none()
@@ -131,7 +135,7 @@ def search_messages(session: Session, q: str, limit: int = 50) -> list[Message]:
             ORDER BY COALESCE(m.date_iso, '') DESC, m.id DESC
             LIMIT :lim
         """), {"q": q, "lim": int(limit)}).fetchall()
-    except OperationalError as e:
+    except OperationalError:
         # Fallback if FTS is unavailable in this DB for any reason
         id_rows = session.execute(text("""
             SELECT id FROM message
@@ -156,4 +160,195 @@ def get_message_body(session: Session, message_id: int) -> Optional[str]:
         select(MessageBody.body_full).where(MessageBody.message_id == message_id)
     ).scalar_one_or_none()
     return row
+
+
+# ---------------------
+# Analysis & labels
+# ---------------------
+
+def get_analysis(session: Session, message_id: int) -> Optional[MessageAnalysis]:
+    return session.execute(
+        select(MessageAnalysis).where(MessageAnalysis.message_id == message_id)
+    ).scalar_one_or_none()
+
+
+def upsert_analysis(
+    session: Session,
+    message_id: int,
+    body_hash: str,
+    summary_json: str,
+    error: Optional[str] = None,
+) -> MessageAnalysis:
+    row = get_analysis(session, message_id)
+    if row:
+        row.body_hash = body_hash
+        row.summary_json = summary_json
+        row.last_error = error
+        row.updated_at = datetime.utcnow()
+        session.add(row)
+        return row
+    row = MessageAnalysis(
+        message_id=message_id,
+        body_hash=body_hash,
+        summary_json=summary_json,
+        last_error=error,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    session.add(row)
+    session.flush()
+    return row
+
+
+def list_labels(session: Session) -> List[Label]:
+    return list(session.execute(select(Label).order_by(Label.name.asc())).scalars())
+
+
+def upsert_label(session: Session, name: str, color: Optional[str] = None, weight: int = 0) -> Label:
+    lab = session.execute(select(Label).where(Label.name == name)).scalar_one_or_none()
+    if lab:
+        if color is not None:
+            lab.color = color
+        if weight is not None:
+            lab.weight = int(weight)
+        session.add(lab)
+        return lab
+    lab = Label(name=name, color=color, weight=int(weight or 0))
+    session.add(lab)
+    session.flush()
+    return lab
+
+
+def apply_labels(session: Session, message_id: int, label_names: List[str]) -> None:
+    if label_names is None:
+        return
+    # Ensure labels exist
+    name_to_id: Dict[str, int] = {}
+    for nm in label_names:
+        nm = (nm or "").strip()
+        if not nm:
+            continue
+        lab = session.execute(select(Label).where(Label.name == nm)).scalar_one_or_none()
+        if not lab:
+            lab = Label(name=nm, color=None, weight=0)
+            session.add(lab)
+            session.flush()
+        name_to_id[nm] = lab.id
+
+    # Replace mapping
+    session.execute(delete(MessageLabel).where(MessageLabel.message_id == message_id))
+    for lab_id in name_to_id.values():
+        session.add(MessageLabel(message_id=message_id, label_id=lab_id))
+
+
+def labels_for_message(session: Session, message_id: int) -> List[str]:
+    q = text("""
+        SELECT l.name
+        FROM message_label AS ml
+        JOIN label AS l ON l.id = ml.label_id
+        WHERE ml.message_id = :mid
+        ORDER BY l.name ASC
+    """)
+    rows = session.execute(q, {"mid": message_id}).fetchall()
+    return [r[0] for r in rows]
+
+
+# ---------------------
+# Memory (living prompt)
+# ---------------------
+
+def list_memory(session: Session, kind: Optional[str] = None) -> List[MemoryItem]:
+    stmt = select(MemoryItem)
+    if kind:
+        stmt = stmt.where(MemoryItem.kind == kind)
+    stmt = stmt.order_by(MemoryItem.weight.desc(), MemoryItem.updated_at.desc())
+    return list(session.execute(stmt).scalars())
+
+
+def upsert_memory(
+    session: Session,
+    kind: str,
+    key: str,
+    value: str,
+    weight: int = 0,
+    expires_at: Optional[datetime] = None,
+) -> MemoryItem:
+    row = session.execute(
+        select(MemoryItem).where(MemoryItem.kind == kind, MemoryItem.key == key)
+    ).scalar_one_or_none()
+    if row:
+        row.value = value
+        row.weight = int(weight or 0)
+        row.expires_at = expires_at
+        row.updated_at = datetime.utcnow()
+        session.add(row)
+        return row
+    row = MemoryItem(
+        kind=kind,
+        key=key,
+        value=value,
+        weight=int(weight or 0),
+        expires_at=expires_at,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    session.add(row)
+    session.flush()
+    return row
+
+
+def compose_allowed_labels(session: Session) -> List[str]:
+    labs = list_labels(session)
+    return [l.name for l in labs] if labs else ["work", "personal", "finance", "newsletter", "uncategorized"]
+
+
+# ---------------------
+# Backlog query
+# ---------------------
+
+def _derive_priority(importance: int, urgency: int) -> int:
+    # priority = round((2*importance + urgency)/3 * 20) -> 0..100
+    importance = max(0, min(int(importance), 5))
+    urgency = max(0, min(int(urgency), 5))
+    score = (2 * importance + urgency) / 3.0
+    return int(round(score * 20))
+
+
+def get_backlog(
+    session: Session,
+    limit: int = 50,
+    offset: int = 0,
+    min_priority: int = 0,
+    only_unread: bool = False,
+) -> List[Tuple[Message, Optional[MessageAnalysis], int]]:
+    """
+    Return (Message, Analysis, derived_priority) sorted by derived_priority desc, date desc.
+    """
+    # Join message + analysis ids; we’ll compute priority in Python from summary_json
+    stmt = select(Message, MessageAnalysis).join(
+        MessageAnalysis, MessageAnalysis.message_id == Message.id, isouter=True
+    )
+    if only_unread:
+        stmt = stmt.where(Message.is_unread == 1)
+    stmt = stmt.order_by(func.coalesce(Message.date_iso, "").desc(), Message.id.desc()).limit(1000)
+    rows = list(session.execute(stmt).all())
+
+    out: List[Tuple[Message, Optional[MessageAnalysis], int]] = []
+    import json as _json
+    for (msg, an) in rows:
+        importance = urgency = 0
+        if an and an.summary_json:
+            try:
+                data = _json.loads(an.summary_json)
+                importance = int(data.get("importance", 0) or 0)
+                urgency = int(data.get("urgency", 0) or 0)
+            except Exception:
+                pass
+        pr = _derive_priority(importance, urgency)
+        if pr >= int(min_priority or 0):
+            out.append((msg, an, pr))
+
+    # Sort and paginate
+    out.sort(key=lambda t: (t[2], t[0].date_iso or "", t[0].id), reverse=True)
+    return out[offset: offset + limit]
 

@@ -26,6 +26,7 @@ frontend/dist/
 .vscode/
 .idea/
 *~
+*.swp
 
 
 # Custom files

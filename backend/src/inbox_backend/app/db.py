@@ -112,6 +112,7 @@ def migrate_schema() -> None:
             "is_answered": "INTEGER DEFAULT 0 NOT NULL",
             "is_flagged": "INTEGER DEFAULT 0 NOT NULL",
             "body_preview": "TEXT",
+            "body_hash": "TEXT",
         }
         for col, decl in add_cols.items():
             if not _column_exists(conn, "message", col):

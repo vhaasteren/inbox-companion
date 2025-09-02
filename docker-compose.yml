@@ -8,6 +8,7 @@ services:
       - OLLAMA_URL=${OLLAMA_URL:-http://127.0.0.1:11434}
       # If you run Proton Bridge on the HOST:
       # IMAP_HOST should be host.docker.internal in your .env (see env_example.env)
+      - LLM_TIMEOUT_SECONDS=300
     ports:
       - "127.0.0.1:8000:8000"
     network_mode: bridge
