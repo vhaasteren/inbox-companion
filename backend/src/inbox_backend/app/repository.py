@@ -1,9 +1,10 @@
 from __future__ import annotations
 from datetime import datetime
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Optional, Sequence, List, Dict
 
-from sqlalchemy import select, func
+from sqlalchemy import select, func, text
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import OperationalError
 
 from .models import Mailbox, Message, MessageBody
 
@@ -118,28 +119,36 @@ def get_recent_uids(session: Session, mailbox: str, limit: int) -> list[int]:
 def search_messages(session: Session, q: str, limit: int = 50) -> list[Message]:
     """
     Full-text search using FTS5 over (subject, from_raw, snippet, body_preview).
-    Ordered by recency (date_iso desc, id desc) for predictable UX.
+    We cannot alias the FTS table on the left side of MATCH in SQLite, so we must
+    refer to it by its real name.
     """
-    # Use a raw SQL join since FTS5 virtual tables aren't mapped.
-    rows = session.execute(text("""
-        SELECT m.*
-        FROM message m
-        JOIN message_fts fts ON fts.rowid = m.id
-        WHERE fts MATCH :q
-        ORDER BY COALESCE(m.date_iso, '') DESC, m.id DESC
-        LIMIT :lim
-    """), {"q": q, "lim": int(limit)}).fetchall()
-    # Convert to ORM objects via a second query on ids to avoid reflection hassles
-    if not rows:
+    try:
+        id_rows = session.execute(text("""
+            SELECT m.id
+            FROM message_fts
+            JOIN message AS m ON message_fts.rowid = m.id
+            WHERE message_fts MATCH :q
+            ORDER BY COALESCE(m.date_iso, '') DESC, m.id DESC
+            LIMIT :lim
+        """), {"q": q, "lim": int(limit)}).fetchall()
+    except OperationalError as e:
+        # Fallback if FTS is unavailable in this DB for any reason
+        id_rows = session.execute(text("""
+            SELECT id FROM message
+            WHERE subject LIKE :like
+               OR from_raw LIKE :like
+               OR snippet LIKE :like
+               OR COALESCE(body_preview,'') LIKE :like
+            ORDER BY COALESCE(date_iso, '') DESC, id DESC
+            LIMIT :lim
+        """), {"like": f"%{q}%", "lim": int(limit)}).fetchall()
+
+    if not id_rows:
         return []
-    ids = [r[0] for r in rows]  # first column is m.id
+    ids = [r[0] for r in id_rows]
     stmt = select(Message).where(Message.id.in_(ids))
-    # Preserve ordering by ids order
     obj_map = {m.id: m for m in session.execute(stmt).scalars()}
     return [obj_map[i] for i in ids if i in obj_map]
-
-
-from sqlalchemy import text  # placed after functions to satisfy linters
 
 
 def get_message_body(session: Session, message_id: int) -> Optional[str]:
