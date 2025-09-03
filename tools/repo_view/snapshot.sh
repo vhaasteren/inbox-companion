@@ -30,18 +30,17 @@ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   in_git_repo=true
 fi
 
-# Build git pathspec-style excludes
+# Build git pathspec-style excludes (use :(exclude) for wide compatibility)
 build_git_excludes() {
   local token
-  local -a out=()
   for token in $EXCL_RAW; do
     if [[ "$token" == *"*"* || "$token" == *"?"* || "$token" == *"["* ]]; then
-      out+=(":!$token")
+      echo ":(exclude)$token"
     else
-      out+=(":!$token/**")
+      echo ":(exclude)$token"
+      echo ":(exclude)$token/**"
     fi
   done
-  printf '%s\0' "${out[@]}" 2>/dev/null || true
 }
 
 # Build list of include roots (if any)
@@ -50,7 +49,10 @@ read -r -a INCLUDE_PATHS <<< "$PATHS_RAW"
 files=()
 
 if $in_git_repo; then
-  IFS= read -r -d '' -a EXCL_OPTS < <(build_git_excludes || printf '\0')
+  EXCL_OPTS=()
+  while IFS= read -r line; do
+    [ -n "$line" ] && EXCL_OPTS+=("$line")
+  done < <(build_git_excludes || true)
 
   # Tracked files
   if [ ${#INCLUDE_PATHS[@]} -gt 0 ]; then
@@ -95,31 +97,33 @@ fi
 
 # Non-git fallback
 if [ ${#files[@]} -eq 0 ]; then
-  # Build find excludes
+  # Build a prune group so we never descend into excluded directories/globs
   SKIP="$EXCL_RAW"
-  build_find_expr() {
-    local -a expr=("$1")
+  build_find_with_prune() {
+    local root="$1"
+    local -a prune=()
     local s
     for s in $SKIP; do
       if [[ "$s" == *"*"* || "$s" == *"?"* || "$s" == *"["* ]]; then
-        expr+=( -not -name "$s" )
+        prune+=( -name "$s" -o )
       else
-        expr+=( -not -path "*/$s/*" )
+        prune+=( -path "$root/$s" -o -path "$root/$s/*" -o -path "*/$s" -o -path "*/$s/*" -o )
       fi
     done
-    printf '%s\0' "${expr[@]}"
+    if [ "${#prune[@]}" -gt 0 ]; then unset 'prune[${#prune[@]}-1]'; fi
+    if [ "${#prune[@]}" -gt 0 ]; then
+      find "$root" \( "${prune[@]}" \) -prune -o -type f -print0
+    else
+      find "$root" -type f -print0
+    fi
   }
 
   if [ ${#INCLUDE_PATHS[@]} -gt 0 ]; then
     for root in "${INCLUDE_PATHS[@]}"; do
-      IFS= read -r -d '' -a EXPR < <(build_find_expr "$root" || printf '\0')
-      while IFS= read -r -d '' f; do files+=("$f"); done \
-        < <(find "${EXPR[@]}" -type f -print0)
+      while IFS= read -r -d '' f; do files+=("$f"); done < <(build_find_with_prune "$root")
     done
   else
-    IFS= read -r -d '' -a EXPR < <(build_find_expr "." || printf '\0')
-    while IFS= read -r -d '' f; do files+=("$f"); done \
-      < <(find "${EXPR[@]}" -type f -print0)
+    while IFS= read -r -d '' f; do files+=("$f"); done < <(build_find_with_prune ".")
   fi
 fi
 
