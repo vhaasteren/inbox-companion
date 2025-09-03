@@ -61,6 +61,10 @@ def upsert_messages(session: Session, rows: Iterable[dict]) -> int:
                 if k in m and getattr(existing, k) != m[k]:
                     setattr(existing, k, m[k]); changed = True
             if changed:
+                try:
+                    existing.updated_at = datetime.utcnow()
+                except Exception:
+                    pass
                 session.add(existing)
             if body_full:
                 has_body = session.execute(

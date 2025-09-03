@@ -58,6 +58,10 @@ class Message(Base):
     in_reply_to: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     references_raw: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # Timestamps (match NOT NULL schema already present in SQLite)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
     __table_args__ = (
         UniqueConstraint("mailbox", "uid", name="uix_mailbox_uid"),
         Index("ix_msg_date", "date_iso"),
