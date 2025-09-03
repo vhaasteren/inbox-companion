@@ -183,7 +183,7 @@ def fetch_uids_since(client: imaplib.IMAP4, last_uid: int, since_str: str | None
             crit.append("UNSEEN")
         if since_str:
             crit += ["SINCE", since_str]
-        typ, data = client.search(None, *crit) if crit else client.search(None, "ALL")
+        typ, data = client.uid("SEARCH", None, *crit) if crit else client.uid("SEARCH", None, "ALL")
         if typ != "OK" or not data:
             return []
         return data[0].split()

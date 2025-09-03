@@ -9,12 +9,14 @@ services:
       # If you run Proton Bridge on the HOST:
       # IMAP_HOST should be host.docker.internal in your .env (see env_example.env)
       - LLM_TIMEOUT_SECONDS=300
+      - ACCOUNTS_CONFIG=/config/accounts.json
     ports:
       - "127.0.0.1:8000:8000"
     network_mode: bridge
     command: ["uvicorn", "inbox_backend.app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     volumes:
       - ./state:/data
+      - ./config:/config
     extra_hosts:
       - "host.docker.internal:host-gateway"
 

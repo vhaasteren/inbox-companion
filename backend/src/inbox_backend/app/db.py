@@ -118,6 +118,16 @@ def migrate_schema() -> None:
             if not _column_exists(conn, "message", col):
                 conn.execute(text(f"ALTER TABLE message ADD COLUMN {col} {decl};"))
 
+        # Ensure created_at / updated_at exist on message
+        # IMPORTANT: no DEFAULT(CURRENT_TIMESTAMP) in ALTER TABLE (not allowed by SQLite)
+        if not _column_exists(conn, "message", "created_at"):
+            conn.execute(text("ALTER TABLE message ADD COLUMN created_at DATETIME;"))
+            conn.execute(text("UPDATE message SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL;"))
+
+        if not _column_exists(conn, "message", "updated_at"):
+            conn.execute(text("ALTER TABLE message ADD COLUMN updated_at DATETIME;"))
+            conn.execute(text("UPDATE message SET updated_at = COALESCE(created_at, CURRENT_TIMESTAMP) WHERE updated_at IS NULL;"))
+
         # FTS virtual table and triggers
         _create_fts(conn)
 
