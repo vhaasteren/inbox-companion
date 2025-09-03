@@ -458,8 +458,15 @@ export default function App() {
   }
 
   const filteredItems = useMemo(() => {
-    if (!unreadOnly) return items
-    return items.filter((it) => it.is_unread)
+    // Always sort by received time (newest first), tie-break by id desc
+    const byDateDescThenIdDesc = (a: RecentItem, b: RecentItem) => {
+      const ta = a.date ? Date.parse(a.date) : 0
+      const tb = b.date ? Date.parse(b.date) : 0
+      if (tb !== ta) return tb - ta
+      return (b.id || 0) - (a.id || 0)
+    }
+    const sorted = [...items].sort(byDateDescThenIdDesc)
+    return unreadOnly ? sorted.filter((it) => it.is_unread) : sorted
   }, [items, unreadOnly])
 
   const onToggleRow = async (id: number) => {
@@ -917,7 +924,7 @@ export default function App() {
             <div className="col-span-1 text-right">Date</div>
             <div className="col-span-1 text-right">Flags</div>
           </div>
-          {(unreadOnly ? filteredItems : items).length === 0 && (
+          {filteredItems.length === 0 && (
             <div className="p-6 text-gray-600 text-sm">No messages to show.</div>
           )}
           {filteredItems.map((it) => (

@@ -341,14 +341,89 @@ def _compose_system_prompt_with_user_info() -> str:
 
 
 async def summarize_one_id(mid: int, model: Optional[str] = None, force: bool = False) -> Dict[str, Any]:
+    # ------- helpers (scoped to this function) -------
+    def _clamp_int(x: Any, lo: int = 0, hi: int = 5) -> int:
+        try:
+            v = int(x)
+        except Exception:
+            v = 0
+        return max(lo, min(hi, v))
+
+    def _as_float01(x: Any) -> float:
+        try:
+            v = float(x)
+        except Exception:
+            v = 0.0
+        if v != v:  # NaN
+            v = 0.0
+        return max(0.0, min(1.0, v))
+
+    def _as_bool(x: Any) -> bool:
+        try:
+            return bool(x)
+        except Exception:
+            return False
+
+    def _coerce_str(x: Any) -> str:
+        if x is None:
+            return ""
+        if isinstance(x, str):
+            return x.strip()
+        # handle common LLM mistakes like {"text": "..."} or {"value": "..."}
+        if isinstance(x, dict):
+            for k in ("text", "value", "content"):
+                if k in x and isinstance(x[k], (str, int, float)):
+                    return str(x[k]).strip()
+        # fall back
+        try:
+            return str(x).strip()
+        except Exception:
+            return ""
+
+    def _str_list(x: Any, max_n: int = 3) -> list[str]:
+        """
+        Coerce nested/dirty structures into a flat list[str].
+        Accepts single string, list of strings, nested lists, or objects with .text/.value.
+        Removes empties and preserves order/uniques. Truncates to max_n.
+        """
+        out: list[str] = []
+
+        def _walk(v: Any):
+            if v is None:
+                return
+            if isinstance(v, (list, tuple)):
+                for el in v:
+                    _walk(el)
+                return
+            s = _coerce_str(v)
+            if s:
+                out.append(s)
+
+        _walk(x)
+
+        # de-dupe while preserving order
+        seen: set[str] = set()
+        flat: list[str] = []
+        for s in out:
+            if s not in seen:
+                seen.add(s)
+                flat.append(s)
+
+        return flat[:max_n]
+
     # ------- Load things inside session -------
     with session_scope() as s:
         msg = s.get(Message, mid)
         if not msg:
             return {"id": mid, "status": "not_found"}
 
-        export = _export_message_fields(msg)
-        body = get_message_body(s, mid) or export["body_preview"] or ""
+        export = {
+            "subject": msg.subject or "",
+            "from_name": (msg.from_name or "") or (msg.from_raw or ""),
+            "from_email": msg.from_email or "",
+            "date_iso": msg.date_iso or "",
+        }
+        body = get_message_body(s, mid) or (msg.body_preview or "") or ""
 
         # Build normalized text for hashing/clip
         text = _normalize_body(
@@ -379,7 +454,8 @@ async def summarize_one_id(mid: int, model: Optional[str] = None, force: bool = 
         allowed = compose_allowed_labels(s)
         mem_items = list_memory(s)
         mem_block = compose_memory_block(
-            [{"kind": m.kind, "key": m.key, "value": m.value} for m in mem_items], max_chars=3000
+            [{"kind": m.kind, "key": m.key, "value": m.value} for m in mem_items],
+            max_chars=3000,
         )
 
     # ------- Outside session (no ORM access) -------
@@ -402,21 +478,45 @@ async def summarize_one_id(mid: int, model: Optional[str] = None, force: bool = 
             upsert_analysis(s, mid, current_hash, "", error=err or "unknown error")
         return {"id": mid, "status": "error", "error": err or "unknown error"}
 
-    out = AnalysisOut(**{
-        "version": int(obj.get("version", 2) or 2),
-        "lang": obj.get("lang", "en") or "en",
-        "bullets": [b for b in (obj.get("bullets") or [])][:3],
-        "key_actions": [a for a in (obj.get("key_actions") or [])][:3],
-        "urgency": int(obj.get("urgency", 0) or 0),
-        "importance": int(obj.get("importance", 0) or 0),
-        "priority": 0,
-        "labels": [l for l in (obj.get("labels") or [])][:3],
-        "confidence": float(obj.get("confidence", 0.0) or 0.0),
-        "truncated": bool(obj.get("truncated", truncated)),
-        "model": model or getattr(settings, "llm_model_summary", "deepseek-r1:8b"),
-        "token_usage": {"prompt": int(usage.get("prompt", 0)), "completion": int(usage.get("completion", 0))},
-        "notes": obj.get("notes", "") or "",
-    })
+    # -------- Sanitize model output BEFORE Pydantic validation --------
+    bullets = _str_list(obj.get("bullets"), max_n=3)
+    key_actions = _str_list(obj.get("key_actions"), max_n=3)
+    labels_raw = _str_list(obj.get("labels"), max_n=10)  # take more here, slice to 3 after normalization
+
+    # Map labels to existing (case-insensitive) when possible, else keep as typed
+    # and trim to 3.
+    allowed_lower = {lab.lower(): lab for lab in (allowed or [])}
+    labels_norm: list[str] = []
+    seen_lab: set[str] = set()
+    for lab in labels_raw:
+        key = lab.strip().lower()
+        if not key:
+            continue
+        canon = allowed_lower.get(key, lab.strip())
+        if canon not in seen_lab:
+            seen_lab.add(canon)
+            labels_norm.append(canon)
+        if len(labels_norm) >= 3:
+            break
+
+    out = AnalysisOut(
+        version=int(obj.get("version", 2) or 2),
+        lang=_coerce_str(obj.get("lang") or "en") or "en",
+        bullets=bullets,
+        key_actions=key_actions,
+        urgency=_clamp_int(obj.get("urgency", 0), 0, 5),
+        importance=_clamp_int(obj.get("importance", 0), 0, 5),
+        priority=0,  # derived elsewhere
+        labels=labels_norm,
+        confidence=_as_float01(obj.get("confidence", 0.0)),
+        truncated=_as_bool(obj.get("truncated", truncated)),
+        model=_coerce_str(model or getattr(settings, "llm_model_summary", "deepseek-r1:8b")) or "deepseek-r1:8b",
+        token_usage={
+            "prompt": int(usage.get("prompt", 0) or 0),
+            "completion": int(usage.get("completion", 0) or 0),
+        },
+        notes=_coerce_str(obj.get("notes", "")),
+    )
 
     with session_scope() as s:
         upsert_analysis(s, mid, current_hash, json.dumps(out.dict()), error=None)
