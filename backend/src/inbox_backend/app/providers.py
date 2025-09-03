@@ -6,11 +6,14 @@ import json
 import imaplib
 import ssl
 import os
+import logging
 
 try:
     import yaml  # type: ignore
 except Exception:
     yaml = None  # type: ignore
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -94,6 +97,13 @@ def iter_accounts_from_settings(settings) -> List[AccountConfig]:
 
 def open_imap_connection(acct: AccountConfig, mailbox: str) -> imaplib.IMAP4:
     """Open & SELECT a mailbox with SSL or STARTTLS; tls_verify can be disabled (local bridges)."""
+
+    # Warnings
+    if acct.imap.get("use_ssl") and int(acct.imap.get("port", 0)) == 143:
+        log.warning("[%s] use_ssl=true with port 143 usually means STARTTLS. Set use_ssl=false, use_starttls=true, or switch to port 993.", acct.id)
+    if acct.imap.get("use_starttls") and int(acct.imap.get("port", 0)) == 993:
+        log.warning("[%s] use_starttls=true on 993 is unusual; IMAPS typically uses SSL without STARTTLS.", acct.id)
+
     host = acct.imap.get("host") or "127.0.0.1"
     port = int(acct.imap.get("port") or 993)
     use_ssl = bool(acct.imap.get("use_ssl", port == 993))

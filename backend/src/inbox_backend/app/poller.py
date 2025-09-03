@@ -133,7 +133,7 @@ def backfill_since_days_acct(acct: AccountConfig, mailbox: str, days: int, only_
         if only_unseen:
             crit.append("UNSEEN")
         crit += ["SINCE", _imap_date_str(days)]
-        typ, data = client.search(None, *crit)
+        typ, data = client.uid("SEARCH", None, *crit)
         if typ != "OK" or not data:
             return {"account_id": acct.id, "mailbox": mailbox, "fetched": 0, "inserted": 0, "note": "search returned no data"}
 

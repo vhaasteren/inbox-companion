@@ -163,23 +163,33 @@ async def api_backfill(req: BackfillRequest):
             acct_id, mb = req.mailbox.split(":", 1)
             for acct in accounts:
                 if acct.id == acct_id:
-                    summaries.append(
-                        backfill_since_days_acct(acct, mb, days=req.days, only_unseen=req.only_unseen, limit=req.limit)
-                    )
+                    try:
+                        summaries.append(
+                            backfill_since_days_acct(acct, mb, days=req.days, only_unseen=req.only_unseen, limit=req.limit)
+                        )
+                    except Exception as e:
+                        summaries.append({"account_id": acct.id, "mailbox": mb, "fetched": 0, "inserted": 0, "error": str(e)})
+
                     break
             if not summaries:
                 raise HTTPException(status_code=400, detail=f"Unknown account in mailbox: {acct_id}")
         else:
             for acct in accounts:
-                summaries.append(
-                    backfill_since_days_acct(acct, req.mailbox, days=req.days, only_unseen=req.only_unseen, limit=req.limit)
-                )
+                try:
+                    summaries.append(
+                        backfill_since_days_acct(acct, req.mailbox, days=req.days, only_unseen=req.only_unseen, limit=req.limit)
+                    )
+                except Exception as e:
+                    summaries.append({"account_id": acct.id, "mailbox": mb, "fetched": 0, "inserted": 0, "error": str(e)})
     else:
         for acct in accounts:
             for mb in acct.mailbox_names():
-                summaries.append(
-                    backfill_since_days_acct(acct, mb, days=req.days, only_unseen=req.only_unseen, limit=req.limit)
-                )
+                try:
+                    summaries.append(
+                        backfill_since_days_acct(acct, mb, days=req.days, only_unseen=req.only_unseen, limit=req.limit)
+                    )
+                except Exception as e:
+                    summaries.append({"account_id": acct.id, "mailbox": mb, "fetched": 0, "inserted": 0, "error": str(e)})
     total_inserted = sum(s.get("inserted", 0) for s in summaries)
     total_fetched = sum(s.get("fetched", 0) for s in summaries)
     return {"total_fetched": total_fetched, "total_inserted": total_inserted, "mailboxes": summaries}
