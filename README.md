@@ -1,4 +1,3 @@
-````markdown
 # Inbox Companion
 
 Inbox Companion is a **local-first email assistant** that helps you move toward *Inbox Zero* without sending your mail to anyone else’s cloud.
