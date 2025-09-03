@@ -21,12 +21,17 @@ class Settings(BaseModel):
     imap_use_starttls: bool = os.getenv("IMAP_USE_STARTTLS", "true").lower() == "true"
     imap_tls_verify: bool = os.getenv("IMAP_TLS_VERIFY", "true").lower() == "true"
 
+    # Multi-account configuration (either):
+    # - ACCOUNTS_JSON: inline JSON in env with {"accounts":[...]}
+    # - ACCOUNTS_CONFIG: path to a YAML or JSON file inside the container
+    accounts_config: str | None = os.getenv("ACCOUNTS_CONFIG") or None
+
     # DB / polling (persisted via /data bind mount in docker-compose)
     db_path: str = os.getenv("DB_PATH", "/data/inbox.sqlite3")
     poll_interval_seconds: int = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))
 
     # Backfill / fetch policy
-    backfill_days_max: int = int(os.getenv("BACKFILL_DAYS_MAX", "200"))  # initial backfill time window
+    backfill_days_max: int = int(os.getenv("BACKFILL_DAYS_MAX", "200"))  # initial backfill window
     only_unseen: bool = os.getenv("ONLY_UNSEEN", "true").lower() == "true"
 
     # How many recent stored messages (per mailbox) to re-sync FLAGS each cycle
@@ -41,4 +46,3 @@ class Settings(BaseModel):
 
 
 settings = Settings()
-

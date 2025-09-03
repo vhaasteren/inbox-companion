@@ -1,0 +1,29 @@
+{
+  "accounts": [
+    {
+      "id": "proton-home",
+      "provider": "protonbridge",
+      "imap": {
+        "host": "host.docker.internal",
+        "port": 1143,
+        "use_starttls": true,
+        "tls_verify": false,
+        "username": "USERNAME",
+        "password": "PASSWORD"
+      },
+      "mailboxes": ["INBOX"]
+    }
+    ,{
+      "id": "OX-AEI",
+      "provider": "open-exchange",
+      "imap": {
+        "host": "umail2.aei.mpg.de",
+        "port": 143,
+        "use_ssl": true,
+        "username": "USERNAME",
+        "password": "EXAMPLE"
+      },
+      "mailboxes": ["INBOX"]
+    }
+  ]
+}

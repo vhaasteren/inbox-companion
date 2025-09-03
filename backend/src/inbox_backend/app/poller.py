@@ -1,6 +1,5 @@
 from __future__ import annotations
 import imaplib
-import ssl
 import re
 from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -12,21 +11,7 @@ from .repository import (
     get_recent_uids, update_flags_for_uids
 )
 from .imap_preview import fetch_uids_since, fetch_message_by_uid
-
-
-def _imap_connect(mailbox: str) -> imaplib.IMAP4:
-    client = imaplib.IMAP4(settings.imap_host, settings.imap_port)
-    if settings.imap_use_starttls:
-        context = ssl.create_default_context()
-        if not settings.imap_tls_verify:
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-        client.starttls(ssl_context=context)
-    client.login(settings.imap_user, settings.imap_pass)
-    typ, _ = client.select(mailbox, readonly=True)
-    if typ != "OK":
-        raise RuntimeError(f"Cannot select mailbox: {mailbox}")
-    return client
+from .providers import AccountConfig, iter_accounts_from_settings, open_imap_connection
 
 
 def _imap_date_str(days_ago: int) -> str:
@@ -34,15 +19,21 @@ def _imap_date_str(days_ago: int) -> str:
     return d.strftime("%d-%b-%Y")  # IMAP format, e.g., 20-Aug-2025
 
 
-def poll_mailbox(mailbox: str) -> dict:
-    """
-    Standard polling cycle (respects last_uid and default backfill policy).
-    """
-    with session_scope() as s:
-        ensure_mailbox(s, mailbox)
-        last_uid = get_last_uid(s, mailbox)
+def _compose_box_name(acct: AccountConfig, mailbox: str) -> str:
+    # Unique across accounts without DB schema changes
+    return f"{acct.id}:{mailbox}"
 
-    client = _imap_connect(mailbox)
+
+def poll_account_mailbox(acct: AccountConfig, mailbox: str) -> dict:
+    """
+    Standard polling cycle (respects last_uid and default backfill policy) for one account/mailbox.
+    """
+    box_key = _compose_box_name(acct, mailbox)
+    with session_scope() as s:
+        ensure_mailbox(s, box_key)
+        last_uid = get_last_uid(s, box_key)
+
+    client = open_imap_connection(acct, mailbox)
     try:
         since_str = _imap_date_str(settings.backfill_days_max) if last_uid <= 0 else None
         uids = fetch_uids_since(
@@ -57,7 +48,7 @@ def poll_mailbox(mailbox: str) -> dict:
 
         for uid in uids:
             try:
-                row, uid_int = fetch_message_by_uid(client, mailbox, uid)
+                row, uid_int = fetch_message_by_uid(client, box_key, uid)
                 max_uid_seen = max(max_uid_seen, uid_int)
                 with session_scope() as s:
                     inserted += upsert_messages(s, [row])
@@ -67,13 +58,12 @@ def poll_mailbox(mailbox: str) -> dict:
         # Sync FLAGS for recent stored messages to capture read/star changes
         recent_limit = max(0, int(settings.flag_sync_recent))
         if recent_limit > 0:
-            from .repository import get_recent_uids  # local import already added
             with session_scope() as s:
-                recent_uids = get_recent_uids(s, mailbox, limit=recent_limit)
-            flag_map: dict[int, tuple[int,int,int]] = {}
+                recent_uids = get_recent_uids(s, box_key, limit=recent_limit)
+            flag_map: dict[int, tuple[int, int, int]] = {}
             CHUNK = 200
             for i in range(0, len(recent_uids), CHUNK):
-                chunk = recent_uids[i:i+CHUNK]
+                chunk = recent_uids[i:i + CHUNK]
                 if not chunk:
                     continue
                 uid_list = ",".join(str(u) for u in chunk)
@@ -96,39 +86,48 @@ def poll_mailbox(mailbox: str) -> dict:
                     flag_map[m_uid] = (0 if seen else 1, 1 if answered else 0, 1 if flagged else 0)
             if flag_map:
                 with session_scope() as s:
-                    update_flags_for_uids(s, mailbox, flag_map)
+                    update_flags_for_uids(s, box_key, flag_map)
 
         with session_scope() as s:
-            set_last_uid(s, mailbox, max_uid_seen)
+            set_last_uid(s, box_key, max_uid_seen)
 
-        return {"mailbox": mailbox, "fetched": len(uids), "inserted": inserted, "last_uid": max_uid_seen}
+        return {
+            "account_id": acct.id,
+            "mailbox": mailbox,
+            "box_key": box_key,
+            "fetched": len(uids),
+            "inserted": inserted,
+            "last_uid": max_uid_seen,
+        }
     finally:
         client.logout()
 
 
 def poll_once() -> dict:
     """
-    Poll all configured mailboxes (standard policy).
+    Poll all configured accounts & their mailboxes (standard policy).
     """
     summary = {"total_fetched": 0, "total_inserted": 0, "mailboxes": []}
-    for mb in settings.imap_mailboxes:
-        try:
-            res = poll_mailbox(mb)
-            summary["total_fetched"] += res["fetched"]
-            summary["total_inserted"] += res["inserted"]
-            summary["mailboxes"].append(res)
-        except Exception:
-            continue
+    accounts = iter_accounts_from_settings(settings)
+    for acct in accounts:
+        for mb in acct.mailbox_names():
+            try:
+                res = poll_account_mailbox(acct, mb)
+                summary["total_fetched"] += res["fetched"]
+                summary["total_inserted"] += res["inserted"]
+                summary["mailboxes"].append(res)
+            except Exception:
+                continue
     return summary
 
 
-def backfill_since_days(mailbox: str, days: int, only_unseen: bool = True, limit: int | None = None) -> dict:
+def backfill_since_days_acct(acct: AccountConfig, mailbox: str, days: int, only_unseen: bool = True, limit: int | None = None) -> dict:
     """
-    Historical backfill that ignores last_uid and searches by SINCE <N days>.
+    Historical backfill for a specific account/mailbox (ignores last_uid; uses SINCE <N days>).
     Inserts only messages not yet in DB (idempotent).
-    Use this to pull older unread email further into the past on demand.
     """
-    client = _imap_connect(mailbox)
+    box_key = _compose_box_name(acct, mailbox)
+    client = open_imap_connection(acct, mailbox)
     try:
         crit = []
         if only_unseen:
@@ -136,25 +135,30 @@ def backfill_since_days(mailbox: str, days: int, only_unseen: bool = True, limit
         crit += ["SINCE", _imap_date_str(days)]
         typ, data = client.search(None, *crit)
         if typ != "OK" or not data:
-            return {"mailbox": mailbox, "fetched": 0, "inserted": 0, "note": "search returned no data"}
+            return {"account_id": acct.id, "mailbox": mailbox, "fetched": 0, "inserted": 0, "note": "search returned no data"}
 
         uids = data[0].split()
-        # Optional limit: take oldest first to progress chronologically
         if limit is not None and limit >= 0:
             uids = uids[:limit]
 
         inserted = 0
         for uid in uids:
             try:
-                row, _ = fetch_message_by_uid(client, mailbox, uid)
+                row, _ = fetch_message_by_uid(client, box_key, uid)
                 with session_scope() as s:
                     inserted += upsert_messages(s, [row])
             except Exception:
                 continue
 
-        return {"mailbox": mailbox, "fetched": len(uids), "inserted": inserted}
+        return {"account_id": acct.id, "mailbox": mailbox, "fetched": len(uids), "inserted": inserted}
     finally:
         client.logout()
+
+
+# Backward-compat single-account wrapper
+def backfill_since_days(mailbox: str, days: int, only_unseen: bool = True, limit: int | None = None) -> dict:
+    acct = iter_accounts_from_settings(settings)[0]
+    return backfill_since_days_acct(acct, mailbox, days, only_unseen, limit)
 
 
 def start_scheduler() -> BackgroundScheduler:
@@ -167,4 +171,3 @@ def start_scheduler() -> BackgroundScheduler:
     scheduler.add_job(poll_once, "interval", seconds=settings.poll_interval_seconds, id="poller", replace_existing=True)
     scheduler.start()
     return scheduler
-

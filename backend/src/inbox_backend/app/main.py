@@ -23,8 +23,9 @@ from .repository import (
     list_memory, upsert_memory, compose_allowed_labels,
     find_message_ids_missing_analysis,
 )
-from .poller import start_scheduler, poll_once, backfill_since_days
+from .poller import start_scheduler, poll_once, backfill_since_days, backfill_since_days_acct
 from .llm_client import chat_json, get_system_summary_prompt, build_summary_user_prompt, compose_memory_block, ping_models
+from .providers import iter_accounts_from_settings
 
 app = FastAPI(title="Inbox Companion API", version="0.4.0")
 
@@ -154,13 +155,33 @@ class BackfillRequest(BaseModel):
 
 @app.post("/api/backfill")
 async def api_backfill(req: BackfillRequest):
-    mailboxes = [req.mailbox] if req.mailbox else getattr(settings, "imap_mailboxes", ["INBOX"])
     summaries = []
-    for mb in mailboxes:
-        res = backfill_since_days(mailbox=mb, days=req.days, only_unseen=req.only_unseen, limit=req.limit)
-        summaries.append(res)
-    total_inserted = sum(s["inserted"] for s in summaries)
-    total_fetched = sum(s["fetched"] for s in summaries)
+    accounts = iter_accounts_from_settings(settings)
+    if req.mailbox:
+        # Accept composite form "acct:INBOX"; otherwise run this mailbox on all accounts
+        if ":" in req.mailbox:
+            acct_id, mb = req.mailbox.split(":", 1)
+            for acct in accounts:
+                if acct.id == acct_id:
+                    summaries.append(
+                        backfill_since_days_acct(acct, mb, days=req.days, only_unseen=req.only_unseen, limit=req.limit)
+                    )
+                    break
+            if not summaries:
+                raise HTTPException(status_code=400, detail=f"Unknown account in mailbox: {acct_id}")
+        else:
+            for acct in accounts:
+                summaries.append(
+                    backfill_since_days_acct(acct, req.mailbox, days=req.days, only_unseen=req.only_unseen, limit=req.limit)
+                )
+    else:
+        for acct in accounts:
+            for mb in acct.mailbox_names():
+                summaries.append(
+                    backfill_since_days_acct(acct, mb, days=req.days, only_unseen=req.only_unseen, limit=req.limit)
+                )
+    total_inserted = sum(s.get("inserted", 0) for s in summaries)
+    total_fetched = sum(s.get("fetched", 0) for s in summaries)
     return {"total_fetched": total_fetched, "total_inserted": total_inserted, "mailboxes": summaries}
 
 
