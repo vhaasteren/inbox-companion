@@ -69,7 +69,7 @@ This repo is also an experiment in **LLM-driven coding workflows**:
   make frontend-snapshot    # frontend only
   make meta-snapshot        # everything except backend/frontend
   make pick-snapshot FILES="backend/src/app/main.py frontend/src/App.tsx"
-````
+  ```
 
 * **API surface:**
   Compact list of function/method signatures.
